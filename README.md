@@ -44,7 +44,7 @@ The script handles SIGINT/SIGTERM to:
 *(Just Ctrl+C to exit safely)*
 
 ## 📜 License
-GLWTS © Deepseek R1
+GLWTS © Every-fucking-one, except the Author
 
 ## 💡 Pro Tip
 Add this to your bashrc/zshrc for quick access:
