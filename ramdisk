@@ -1,0 +1,149 @@
+#!/bin/bash
+
+# Function to display usage
+usage() {
+    echo "Usage: ramdisk --mount=<mount_point> --size=<size> --backup=<backup_file>"
+    exit 1
+}
+
+# Function to create a ramdisk
+create_ramdisk() {
+    local size="$1"
+    
+    # Create a file of the specified size in RAM (using /dev/shm)
+    local ramdisk_file=$(mktemp -p /dev/shm)
+    dd if=/dev/zero of="$ramdisk_file" bs=1 count=0 seek="$size" || exit 1
+
+    # Set up a loop device
+    local loop_device=$(sudo losetup -f --show "$ramdisk_file")
+    if [ $? -ne 0 ]; then
+        echo "Failed to create loop device."
+        rm -f "$ramdisk_file"
+        exit 1
+    fi
+
+    # Return loop device and ramdisk file
+    echo "$loop_device"
+    echo "$ramdisk_file"
+}
+
+# Function to backup the ramdisk contents
+backup_ramdisk() {
+    local loop_device="$1"
+    local backup_file="$2"
+    
+    echo "Backing up from loop device: $loop_device to backup file: $backup_file"
+    
+    # Create temporary backup (.1)
+    if ! sudo dd if="$loop_device" of="${backup_file}.1" bs=1M status=progress; then
+        echo "Error: Backup failed!"
+        rm -f "${backup_file}.1"  # Clean up failed backup
+        return 1
+    fi
+    
+    # On success:
+    # 1. Remove old .bak if it exists
+    [ -f "${backup_file}.bak" ] && rm -f "${backup_file}.bak"
+    # 2. Move current backup to .bak
+    [ -f "$backup_file" ] && mv "$backup_file" "${backup_file}.bak"
+    # 3. Promote .1 to main backup
+    mv "${backup_file}.1" "$backup_file"
+    
+    echo "Backup completed successfully with rollback protection."
+}
+
+# Function to restore the ramdisk contents from backup
+restore_ramdisk() {
+    local loop_device="$1"
+    local backup_file="$2"
+    
+    echo "Restoring from backup file: $backup_file to loop device: $loop_device"
+    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
+        sudo dd if="$backup_file" of="$loop_device" bs=1M status=progress
+    fi
+}
+
+# Parse command line arguments
+MOUNT_POINT=""
+SIZE=""
+BACKUP_FILE=""
+
+for arg in "$@"; do
+    case $arg in
+        --mount=*)
+            MOUNT_POINT="${arg#*=}"
+            ;;
+        --size=*)
+            SIZE="${arg#*=}"
+            ;;
+        --backup=*)
+            BACKUP_FILE="${arg#*=}"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+# Check required arguments
+if [ -z "$MOUNT_POINT" ] || [ -z "$BACKUP_FILE" ]; then
+    usage
+fi
+
+# Create mount point
+mkdir -p "$MOUNT_POINT"
+sudo chown $(id -u):$(id -g) "$MOUNT_POINT"
+
+# Ensure backup file exists
+touch "$BACKUP_FILE"
+
+# Determine size
+if [ -f "$BACKUP_FILE" ] && [ -s "$BACKUP_FILE" ]; then
+    SIZE=$(du -b "$BACKUP_FILE" | cut -f1)
+else
+    if [ -z "$SIZE" ]; then
+        echo "Size must be specified if backup file is empty or doesn't exist."
+        exit 1
+    fi
+fi
+
+# Create ramdisk and get loop device and file
+result=$(create_ramdisk "$SIZE")
+LOOP_DEVICE=$(echo "$result" | head -n1)
+RAMDISK_FILE=$(echo "$result" | tail -n1)
+
+# Restore or format
+if [ -s "$BACKUP_FILE" ]; then
+    restore_ramdisk "$LOOP_DEVICE" "$BACKUP_FILE"
+else
+    sudo mkfs.ext4 "$LOOP_DEVICE"
+fi
+
+# Mount the loop device
+sudo mount "$LOOP_DEVICE" "$MOUNT_POINT" || {
+    echo "Failed to mount ramdisk at $MOUNT_POINT"
+    sudo losetup -d "$LOOP_DEVICE"
+    rm -f "$RAMDISK_FILE"
+    exit 1
+}
+sudo chown $(id -u):$(id -g) "$MOUNT_POINT"
+
+# Cleanup function
+cleanup() {
+    echo "Flushing contents to backup..."
+    backup_ramdisk "$LOOP_DEVICE" "$BACKUP_FILE"
+    sudo umount "$MOUNT_POINT"
+    sudo losetup -d "$LOOP_DEVICE"
+    rm -f "$RAMDISK_FILE"
+    exit 0
+}
+
+# Trap signals
+trap cleanup SIGINT SIGTERM
+
+# Periodic backup loop
+while true; do
+    sleep 1800
+    echo "Flushing contents to backup..."
+    backup_ramdisk "$LOOP_DEVICE" "$BACKUP_FILE"
+done
